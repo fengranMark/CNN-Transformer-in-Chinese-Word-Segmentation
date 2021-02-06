@@ -1,1 +1,3 @@
-# Chinese-Word-Segmentation-Model
+# Convolution-Augmented Transformer in Chinese Word Segmentation
+
+
