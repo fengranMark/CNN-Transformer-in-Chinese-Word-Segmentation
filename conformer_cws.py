@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
 
-
-import re, sys, os, codecs
+import re, sys, os, codecs, logging
 import numpy as np
 import torch
 import torch.autograd as autograd
@@ -16,6 +14,8 @@ from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_se
 sys.path.append('../code')
 import score
 import time
+import random
+from optimizers import Optimizer
 
 if torch.cuda.is_available():
     torch.cuda.manual_seed(812)
@@ -24,40 +24,68 @@ if torch.cuda.is_available():
 else:
     torch.manual_seed(812)
     device = torch.device('cpu')
+def setup_seed(seed):
+     torch.manual_seed(seed)
+     torch.cuda.manual_seed_all(seed)
+     np.random.seed(seed)
+     random.seed(seed)
+     torch.backends.cudnn.deterministic = True
+setup_seed(20)
 
+#logger = logging.getLogger()
+#logger.setLevel(logging.INFO)
+#rq = time.strftime('%Y%m%d%H%M', time.localtime(time.time()))
+#log_path = '../data/pku/log/'
+#log_name = log_path + rq + '-16.log'
+#logfile = log_name
+#fh = logging.FileHandler(logfile, mode='w')
+#fh.setLevel(logging.INFO)  # 输出到file的log等级的开关
+# 第三步，定义handler的输出格式
+#formatter = logging.Formatter("%(asctime)s - %(levelname)s: %(message)s")
+#fh.setFormatter(formatter)
+# 第四步，将logger添加到handler里面
+#logger.addHandler(fh)
 
 config = {'hidden_dimensions':200,
           'embedding_dimensions':100, 
+          'bi_embedding_dimensions':100,
           'learning_rate':0.001, 
-          'keep_dropout':0.2, 
-          'emb_dropout':0.2,
-          'hidden_layers':4, 
+          'keep_dropout':0.1, 
+          'emb_dropout':0.1,
+          'hidden_layers':1, 
           'n_heads':4,
           'k_dims':50, # d_model / heads
           'v_dims':50,
           'kernel':3,
           'pretrained':False, 
-          'shuffle':True, 
-          'epochs':50, 
-          'batch_size':32, 
+          'shuffle':True,
+          'epochs':30, 
+          'batch_size':256, 
           'avg_bathch':False, 
           'tagset_size':4, 
+          'bi_gram':True,
           'CRF':True, 
           'max_len':60, 
-          'bi_gram':True, 
-          'bi_embedding_dimensions':100,
-          'special_token_file':'../data/pku/specialToken.txt', 
-          'train_file':'../data/pku/pku_train_file.txt', 
-          'valid_file':'../data/pku/pku_valid_file.txt', 
-          'dict_file':'../data/pku/pku_udict.txt', 
-          'bi_dict_file':'../data/pku/pku_bdict.txt', 
-          'model_path':'../data/pku/model/',              
-          'test_file':'../data/pku/pku_test_file.txt', 
-          'file_for_test':'../data/medical/pku_test_input.txt',
-          'test_model':'', 
-          'update_model':'',
-          'module':'train', 
-          'output_file':'../data/pku/pku_output.txt'
+          'warm_up':False,
+          'SPE':False,
+          'RPR':False,
+          'single FFN':False,
+          'CNN after':True,
+          'CNN before':False,
+          'CNN out':False,
+          'PCNN':False,
+          'special_token_file':'../corpus/specialToken.txt', 
+          'train_file':'../corpus/pku/pku_train_file.txt', 
+          'valid_file':'../corpus/pku/pku_test_file.txt', 
+          'dict_file':'../corpus/pku/pku_udict_1.txt', 
+          'bi_dict_file':'../corpus/pku/pku_bdict_1.txt', 
+          'model_path':'../data/pku/',        
+          'model_name':'pku1_oursnew_best.pkl',
+          'file_for_test':'../corpus/pku/pku_test_input.txt',
+          'test_model':'../data/pku/pku1_oursnew_best.pkl', 
+          'update_model':'', 
+          'output_file':'../output/pku/pku1_oursnew_output.txt',
+          'module':'test',
      }
 
 class Dataset(Dataset):
@@ -256,6 +284,8 @@ def repairResult(sents, results):
             word = ''
             for k in range(len(sents[i])):
                 if results[j][k] == 4:
+                    if word:
+                        word_result.append(word)
                     word_result.append(sents[i][k])
                     word = ''
                 elif results[j][k] == 1:
@@ -307,11 +337,15 @@ def load_dense_drop_repeat(inputs):
         vocab["i2w"].append(w)
     return matrix
 
-#matrix_word = load_dense_drop_repeat("../data/sgns.renmin.char")
-#matrix_bigram = load_dense_drop_repeat("../data/sgns.renmin.bigram")
-#config['unigram_prevocab'] = len(matrix_word)
-#config['bigram_prevocab'] = len(matrix_bigram)
-#print("embedding load finish!")
+if config['pretrained'] == True:
+    matrix_word = load_dense_drop_repeat("../../data/data67454/sgns.renmin.char")
+    matrix_bigram = load_dense_drop_repeat("../../data/data67454/sgns.renmin.bigram")
+    config['unigram_prevocab'] = len(matrix_word)
+    config['bigram_prevocab'] = len(matrix_bigram)
+    config['hidden_dimensions'] = 600
+    config['embedding_dimensions'] = 300
+    config['bi_embedding_dimensions'] = 300
+    print("embedding load finish!")
 
 
 # In[2]:
@@ -323,28 +357,25 @@ class TextSlfAttnNet(nn.Module):
     def __init__(self, config):
         super(TextSlfAttnNet, self).__init__()
         self.embedding_drop = nn.Dropout(p = config['emb_dropout'], inplace=True)
-        # unigram向量
         if config['pretrained']:
             self.word_embedding = nn.Embedding(config['unigram_prevocab'], config['embedding_dimensions'])
             self.word_embedding.weight.data.copy_(torch.from_numpy(matrix_word))
             self.word_embedding.weight.requires_grad = True
+            self.bi_embedding = nn.Embedding(config['bigram_prevocab'], config['bi_embedding_dimensions'])
+            self.bi_embedding.weight.data.copy_(torch.from_numpy(matrix_bigram))
+            self.bi_embedding.weight.requires_grad = True
+            config['embedding_dimensions'] = config['embedding_dimensions'] + config['bi_embedding_dimensions']
         else:
             self.word_embedding = nn.Embedding(config['vocab_size'], config['embedding_dimensions'])
-        # bigram向量
-        if config['bi_gram']:
-            if config['pretrained']:
-                self.bi_embedding = nn.Embedding(config['bigram_prevocab'], config['bi_embedding_dimensions'])
-                self.bi_embedding.weight.data.copy_(torch.from_numpy(matrix_bigram))
-                self.bi_embedding.weight.requires_grad = True
-                config['embedding_dimensions'] = config['embedding_dimensions'] + config['bi_embedding_dimensions']
-            else:
-                self.bi_embedding = nn.Embedding(config['bi_vocab_size'], config['embedding_dimensions'])
-                config['embedding_dimensions'] = config['embedding_dimensions'] + config['bi_embedding_dimensions']
+            self.bi_embedding = nn.Embedding(config['bi_vocab_size'], config['embedding_dimensions'])
+            config['embedding_dimensions'] = config['embedding_dimensions'] + config['bi_embedding_dimensions']
+        
+        if config['PCNN']:
+            self.char_encode = CNNChar(config['embedding_dimensions'], config['embedding_dimensions'], config['kernel'], dropout=config['emb_dropout'])
         else:
-            self.bi_embedding = None
-            config['embedding_dimensions'] = config['embedding_dimensions']
-        self.char_encode = CNNChar(config['embedding_dimensions'] // 2, config['embedding_dimensions'] // 2, config['kernel'], dropout=config['emb_dropout'])
+            self.char_encode = CNNChar(config['embedding_dimensions'] // 2, config['embedding_dimensions'] // 2, config['kernel'], dropout=config['emb_dropout'])
         # 位置向量
+        #if config['SPE']:
         self.pos_embedding = nn.Embedding.from_pretrained(
             get_sinusoid_encoding_table(config['max_len'], config['embedding_dimensions'], padding_idx=0),
             freeze=True)
@@ -352,32 +383,25 @@ class TextSlfAttnNet(nn.Module):
         self.layer_stack = nn.ModuleList([
             EncoderLayer(config['embedding_dimensions'], config['hidden_dimensions'], config['n_heads'], config['k_dims'], config['v_dims'], dropout=config['keep_dropout'])
             for _ in range(config['hidden_layers'])
-        ])
-        self.crf = config['CRF']       
+        ])      
         self.average_batch = config['avg_bathch']
+        self.crf = config['CRF']
         if self.crf:
-            #self.hidden2tag = nn.Linear(config['embedding_dimensions'], config['tagset_size']+3)
-            self.fc_out = nn.Sequential(
-            nn.Dropout(config['keep_dropout']),
-            nn.Linear(config['embedding_dimensions'], config['hidden_dimensions']),
-            nn.ReLU(inplace=True),
-            nn.Dropout(config['keep_dropout']),
-            nn.Linear(config['hidden_dimensions'], config['tagset_size']+3),
-        )
+            #self.fc_out = nn.Sequential(
+            #nn.Dropout(config['keep_dropout']),
+            #nn.Linear(config['embedding_dimensions'], config['hidden_dimensions']),
+            #nn.ReLU(inplace=True),
+            #nn.Dropout(config['keep_dropout']),
+            #nn.Linear(config['hidden_dimensions'], config['tagset_size']+3),
+            #)
+            self.fc_out = nn.Linear(config['embedding_dimensions'], config['tagset_size']+3)
             self.START_TAG_IDX, self.END_TAG_IDX = -2, -1
             init_transitions = torch.randn(config['tagset_size']+3, config['tagset_size']+3)
             init_transitions[:, self.START_TAG_IDX] = -10000.
             init_transitions[self.END_TAG_IDX, :] = -10000.
             self.transitions = nn.Parameter(init_transitions)
         else:
-            self.fc_out = nn.Sequential(
-            nn.Dropout(config['keep_dropout']),
-            nn.Linear(config['embedding_dimensions'], config['hidden_dimensions']),
-            nn.ReLU(inplace=True),
-            nn.Dropout(config['keep_dropout']),
-            nn.Linear(config['hidden_dimensions'], config['tagset_size']+3),
-        )
-            #self.hidden2tag = nn.Linear(config['embedding_dimensions'], config['tagset_size']+1)
+            self.fc_out = nn.Linear(config['embedding_dimensions'], config['tagset_size']+1)
         #fc_out's input [Batch_size, seq_len, d_model
         
     def log_sum_exp(self, vec, m_size):
@@ -447,49 +471,6 @@ class TextSlfAttnNet(nn.Module):
         if self.average_batch:
             return (forward_score - gold_score) / batch_size
         return forward_score - gold_score
-    
-    def calculate_loss(self, inputs, bi_inputs, labels, pos_id, seq_len):
-        loss_function = nn.NLLLoss(ignore_index=0)
-        embeds = self.word_embedding(inputs)
-        uni_char_embeds = self.char_encode(embeds) # CNN
-        if config['bi_gram']:
-            bi_embeds = self.bi_embedding(bi_inputs)
-            bi_char_embeds = self.char_encode(bi_embeds) # CNN
-            #sent_inputs = torch.cat((embeds, bi_embeds), dim=2) # dim = 2
-            sent_inputs = torch.cat((uni_char_embeds, bi_char_embeds), dim=2)
-        else:
-            sent_inputs = embeds
-
-        #print('sent_inputs:', sent_inputs.shape)
-        #sentence_length = sent_inputs.size()[1]
-        #pos_id = torch.LongTensor(np.array([i for i in range(sentence_length)])).to(device)
-        pos_inputs = self.pos_embedding(pos_id)
-        #print('pos_inputs', pos_inputs.shape)
-        # batch_size * sen_len * embedding_size
-        new_inputs = sent_inputs + pos_inputs
-        new_inputs = self.embedding_drop(new_inputs)
-        #print('new_inputs', new_inputs.shape)
-        for layer in self.layer_stack:
-            inputs, _ = layer(new_inputs) # inputs [B, S, D]
-            
-        #outs = self.hidden2tag(inputs)
-        #print('before_fc_out', inputs.shape)
-        outs = self.fc_out(inputs) # [batch_size, seq_len, tag_size]
-        #print("outs_after_fc", outs.shape)
-        if self.crf:
-            plen = inputs.size(1)
-            #seq_len = seq_len.tolist()
-            mask = torch.tensor([[1]*slen + [0]*(plen-slen) for slen in seq_len], dtype=torch.bool).to(device)
-            loss = self.neg_log_likelihood_loss(outs, mask, labels)
-            return loss
-        else:   
-            outs = outs.view(inputs.size(0) * inputs.size(1), -1)
-            #print("before_softmax_loss", outs.shape)
-            scores = F.log_softmax(outs, 1)
-            #print("after_softmax_loss", scores.shape)
-            #print("after_softmax_loss", labels.view(inputs.size(0) * inputs.size(1)))
-            loss = loss_function(scores, labels.view(inputs.size(0) * inputs.size(1)))
-            return loss
         
     def _viterbi_decode(self, feats, mask=None):
         """
@@ -562,31 +543,72 @@ class TextSlfAttnNet(nn.Module):
         path_score = None
         decode_idx = decode_idx.transpose(1, 0)
         return path_score, decode_idx
-    
-    def forward(self, inputs, bi_inputs, pos_id, seq_len):
+        
+    def calculate_loss(self, inputs, bi_inputs, labels, pos_id, seq_len):
+        loss_function = nn.NLLLoss(ignore_index=0)
         embeds = self.word_embedding(inputs)
-        uni_char_embeds = self.char_encode(embeds) # CNN
-        if config['bi_gram']:
-            bi_embeds = self.bi_embedding(bi_inputs)
+        bi_embeds = self.bi_embedding(bi_inputs)
+        if config['CNN out']:
+            uni_char_embeds = self.char_encode(embeds) # CNN
             bi_char_embeds = self.char_encode(bi_embeds) # CNN
-            #sent_inputs = torch.cat((embeds, bi_embeds), dim=2) # dim = 2
             sent_inputs = torch.cat((uni_char_embeds, bi_char_embeds), dim=2)
         else:
-            sent_inputs = embeds
+            sent_inputs = torch.cat((embeds, bi_embeds), dim=2) # dim = 2
 
-        #sentence_length = sent_inputs.size()[1]
-        #pos_id = torch.LongTensor(np.array([i for i in range(sentence_length)])).to(device)
-        pos_inputs = self.pos_embedding(pos_id)
-        # batch_size * sen_len * embedding_size
-        new_inputs = sent_inputs + pos_inputs # [barch_size, seq_len, embedding_dimensions]
+        if config['SPE']:
+            pos_inputs = self.pos_embedding(pos_id)
+            new_inputs = sent_inputs + pos_inputs
+        else:
+            new_inputs = sent_inputs
         new_inputs = self.embedding_drop(new_inputs)
-
-       # new_inputs = torch.cat((sent_inputs, pos_inputs), dim=2)
+        #if config['PCNN']:
+        #    CNN_output = self.char_encode(new_inputs) # P CNN
         for layer in self.layer_stack:
-            inputs, _ = layer(new_inputs) # [barch_size, seq_len, embedding_dimensions]
+            new_inputs, _ = layer(new_inputs) # inputs [B, S, D]
+        if config['PCNN']:
+            CNN_output = self.char_encode(new_inputs)
+            new_inputs = new_inputs + CNN_output # P CNN
+            outs = self.fc_out(new_inputs) # P CNN
+        else:
+            outs = self.fc_out(new_inputs) # [batch_size, seq_len, tag_size]
+        if self.crf:
+            plen = inputs.size(1)
+            #seq_len = seq_len.tolist()
+            mask = torch.tensor([[1]*slen + [0]*(plen-slen) for slen in seq_len], dtype=torch.bool).to(device)
+            loss = self.neg_log_likelihood_loss(outs, mask, labels)
+            return loss
+        else:   
+            outs = outs.view(inputs.size(0) * inputs.size(1), -1)
+            scores = F.log_softmax(outs, 1)
+            loss = loss_function(scores, labels.view(inputs.size(0) * inputs.size(1)))
+            return loss
+            
+    def forward(self, inputs, bi_inputs, pos_id, seq_len):
+        embeds = self.word_embedding(inputs)
+        bi_embeds = self.bi_embedding(bi_inputs)
+        if config['CNN out']:
+            uni_char_embeds = self.char_encode(embeds) # CNN
+            bi_char_embeds = self.char_encode(bi_embeds) # CNN
+            sent_inputs = torch.cat((uni_char_embeds, bi_char_embeds), dim=2)
+        else:
+            sent_inputs = torch.cat((embeds, bi_embeds), dim=2) # dim = 2
         
-        #outs = self.hidden2tag(inputs)
-        outs = self.fc_out(inputs)
+        if config['SPE']:
+            pos_inputs = self.pos_embedding(pos_id)
+            new_inputs = sent_inputs + pos_inputs
+        else:
+            new_inputs = sent_inputs
+        new_inputs = self.embedding_drop(new_inputs)
+        #if config['PCNN']:
+        #    CNN_output = self.char_encode(new_inputs) # P CNN
+        for layer in self.layer_stack:
+            new_inputs, _ = layer(new_inputs) # inputs [B, S, D]
+        if config['PCNN']:
+            CNN_output = self.char_encode(new_inputs)
+            new_inputs = new_inputs + CNN_output # P CNN
+            outs = self.fc_out(new_inputs) # P CNN
+        else:
+            outs = self.fc_out(new_inputs) # [batch_size, seq_len, tag_size]
         if self.crf:
             plen = inputs.size(1)
             #seq_len = seq_len.tolist()
@@ -606,7 +628,6 @@ class EncoderLayer(nn.Module):
 
     def __init__(self, d_model, d_inner, n_head, d_k, d_v, dropout=0.1):
         '''
-
         :param d_model: 模型输入维度
         :param d_inner: 前馈神经网络隐层维度
         :param n_head:  多头注意力
@@ -617,38 +638,44 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
         self.slf_attn = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
         self.pos_ffn = PositionwiseFeedForward(d_model, d_inner, dropout=dropout)
+        self.MLP = MLP(d_model, d_inner)
+        self.CNNChar = CNNChar(d_model, d_model, config['kernel'])
 
     def forward(self, enc_input, non_pad_mask=None, slf_attn_mask=None):
         '''
 
-        :param enc_input:
+        :param enc_input: embedding_dimensions
         :param non_pad_mask:
         :param slf_attn_mask:
         :return:
         '''
         #输入为q k v mask
-        enc_output, enc_slf_attn = self.slf_attn(enc_input, enc_input, enc_input, mask=slf_attn_mask)
-        #print("multi_enc_output (before_ffn)", enc_output.shape)
-        #print("enc_slf_attn (attention_matrix)", enc_slf_attn.shape)
-        if non_pad_mask is not None:
-            enc_output *= non_pad_mask
-
-        enc_output = self.pos_ffn(enc_output)
-        #print("ffn_enc_output (shape == multi_enc_output)", enc_output.shape)
-        if non_pad_mask is not None:
-            enc_output *= non_pad_mask
+        if config['single FFN']:
+            FFN1_output = enc_input
+        else:
+            FFN1_output = self.MLP(enc_input) # first FFN
+        if config['CNN before']:
+            CNN_output = self.CNNChar(FFN1_output)
+            CNN_output += FFN1_output
+            attn_input = CNN_output
+        else:
+            attn_input = FFN1_output
+        attn_output, enc_slf_attn = self.slf_attn(attn_input, attn_input, attn_input, mask=slf_attn_mask)
+        if config['CNN after']:
+            CNN_output = self.CNNChar(attn_output)
+            CNN_output += attn_output
+            FFN2_output = self.MLP(CNN_output) # second FFN
+        else:
+            FFN2_output = self.MLP(attn_output)
+        enc_output = FFN2_output
         return enc_output, enc_slf_attn
-
-
-# In[4]:
-
 
 class Scaled_Dot_Product_Attention(nn.Module):
     '''Scaled Dot-Product Attention '''
     def __init__(self):
         super(Scaled_Dot_Product_Attention, self).__init__()
         
-    def forward(self, Q, K, V, scale=None):
+    def forward(self, Q, K, V):
         '''
         Args:
             Q: [batch_size, len_Q, dim_Q]
@@ -659,8 +686,10 @@ class Scaled_Dot_Product_Attention(nn.Module):
             self-attention后的张量，以及attention张量
         '''
         attention = torch.matmul(Q, K.permute(0, 2, 1))
-        if scale:
-            attention = attention * scale
+        #print("attention:", attention.shape)
+        scale = config['k_dims'] ** 0.5
+        #if scale:
+        attention = attention * scale
         # if mask:  # TODO change this
         #     attention = attention.masked_fill_(mask == 0, -1e9)
         attention = F.softmax(attention, dim=-1)
@@ -695,9 +724,9 @@ class MultiHeadAttention(nn.Module):
         self.w_ks = nn.Linear(d_model, n_head * d_k)
         self.w_vs = nn.Linear(d_model, n_head * d_v)
         #初始化为正态分布
-        #nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
-        #nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
-        #nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_v)))
+        nn.init.normal_(self.w_qs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
+        nn.init.normal_(self.w_ks.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_k)))
+        nn.init.normal_(self.w_vs.weight, mean=0, std=np.sqrt(2.0 / (d_model + d_v)))
 
         #self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5))
         self.attention = Scaled_Dot_Product_Attention()
@@ -706,7 +735,7 @@ class MultiHeadAttention(nn.Module):
         #生成前向向量
         self.fc = nn.Linear(n_head * d_v, d_model)
         #传播时方差不变
-        #nn.init.xavier_normal_(self.fc.weight)
+        nn.init.xavier_normal_(self.fc.weight)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -740,11 +769,15 @@ class MultiHeadAttention(nn.Module):
 
         # mask = mask.repeat(n_head, 1, 1)  # (n*b) x .. x ..
         #
-        output, attn = self.attention(q, k, v)
-        #print('attn_output', output.shape)
+        ORI, attn = self.attention(q, k, v)
+        if config['RPR']:
+            RPR, _ = self.attention(q, ORI, v)
+            output = ORI + RPR
+        else:
+            output = ORI
         # (n_heads * batch_size) * lq * dv
         output = output.view(n_head, sz_b, len_q, d_v)
-        # batch_size * len_q * (n_heads * dv)
+        # batch_size * len_q * (n_heads * dv)        
         output = output.permute(1, 2, 0, 3).contiguous().view(sz_b, len_q, -1)
         output = self.dropout(self.fc(output))
         output = self.layer_normal(output + residual)
@@ -796,7 +829,7 @@ class CNNChar(nn.Module):
         return encoder_output
 
 class MLP(nn.Module):
-    def __init__(self, d_model, d_hidden, dropout=0.1):
+    def __init__(self, d_model, d_hidden, dropout=0.2):
         super(MLP, self).__init__()
         self.fc1 = nn.Linear(d_model, d_hidden)
         self.fc2 = nn.Linear(d_hidden, d_model)
@@ -809,7 +842,10 @@ class MLP(nn.Module):
         encoder_output = F.relu(self.fc1(inputs))
         encoder_output = F.relu(self.fc2(encoder_output))
         encoder_output = self.dropout(encoder_output)
+        #if config['single FFN']:
         encoder_output = self.layerNorm(residual + encoder_output)
+        #else:
+        #    encoder_output = self.layerNorm(residual + 0.5 * encoder_output)
         return encoder_output
 
 # In[7]:
@@ -841,31 +877,25 @@ def get_sinusoid_encoding_table(n_position, d_hid, padding_idx=None):
 
     return torch.FloatTensor(sinusoid_table)
 
-
-# In[8]:
-
-def score_shell(word_dict, gold_file, result_file, output_file):
-    cmd = 'perl score ' + str(word_dict) + ' ' + str(gold_file) + ' ' + str(result_file) + '>' + str(output_file)
-    res = os.system(cmd)
-    return res
-# In[9]:
-
-
 def train(config):
-    print ('get the training data')       
+    print ('get the training data')
+    #logging.info('get the training data')    
     train_data_loader = prepareData(config)
     print ('The training data is %d batches with %d batch sizes'%(len(train_data_loader), config['batch_size']))
+    #logging.info('The training data is %d batches with %d batch sizes'%(len(train_data_loader), config['batch_size']))
     print ('------------------------------------------')
     print ('get the config information')
     print (config)
+    #logging.info(config)
     print ('------------------------------------------')
-    print ('get the test data')
-    config['train_file'] = config['test_file']
+    print ('get the valid data')
+    config['train_file'] = config['valid_file']
     config['shuffle'] = True
     test_data_loader = prepareData(config)
-    writeover = 0
+    print ('The valid data is %d batches with %d batch sizes'%(len(test_data_loader), config['batch_size']))
     print ('------------------------------------------')
     print ('Train step! The model runs on ' + str(device))
+    #logging.info('Train step! The model runs on ' + str(device))
     if config['update_model']:
         model = TextSlfAttnNet(config).to(device)
         load_model_name = config['update_model']
@@ -874,40 +904,92 @@ def train(config):
         model.load_state_dict(checkpoint['net'])
     else:
         model = TextSlfAttnNet(config).to(device)
-    optimizer = optim.Adam(model.parameters(), lr = config['learning_rate'])
-    #optimizer = optim.SGD(model.parameters(), lr = config['learning_rate'], momentum=0.95)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    if config['warm_up']:
+        optimizer = Optimizer('adam', 
+                            config['learning_rate'],
+                            0,
+                            lr_decay=0.5,
+                            beta1=0.9,
+                            beta2=0.98,
+                            decay_method='noam',
+                            start_decay_steps=None,
+                            decay_steps=None,
+                            warmup_steps=16000,
+                            model_size=200,
+                            warmup_start_lr=1e-07,
+                            optims='fairseq'
+                            )
+        optimizer.set_parameters(model)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr = config['learning_rate'])
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    total_params = sum(p.numel() for p in model.parameters())
+    print("total params", total_params)
     loss_list = dict()
-    F_log = 95.14
+    best_f1 = 0.0
+    total_time = 0.0
+    batch_step = 0 #
     for epoch in range(config['epochs']):
         start = time.time()
         model.train()
         model.zero_grad()
-        total_loss = 0
-        batch_step = 0
+        total_loss = 0 
+        batch_loss = 0 #
+        current_batch = 0 #
         for batch, data in enumerate(train_data_loader):
+            model.train() #
             batch_step += 1
             inputs, labels, bi_inputs, pos_id, seq_len = data
             #if not bigram, the bi_inputs is None    
-            #loss_fn = nn.CrossEntropyLoss()
-            #loss = loss_fn(inputs.to(device), labels.to(device))
             loss = model.calculate_loss(inputs.to(device), bi_inputs.to(device), labels.to(device), pos_id.to(device), seq_len)
+            total_loss += float(loss) #
+            batch_loss += float(loss) #
+            current_batch += 1 #
             loss.backward()
             optimizer.step()
             model.zero_grad()
-            total_loss += loss.detach()
+            
+            if (batch_step) % 100 == 0:
+                #valid process
+                model.eval()
+                with torch.no_grad():
+                    result_matrix_list = []
+                    gold_matrix_list = []
+                    for _, data in enumerate(test_data_loader):
+                        inputs, labels, bi_inputs, pos_id, seq_len = data
+                        tag_space = model(inputs.to(device), bi_inputs.to(device), pos_id.to(device), seq_len)           
+                        result_matrix = tag_space.tolist()
+                        result_matrix = [result_matrix[i][:eof] for i, eof in enumerate(seq_len)]  
+                        labels = labels.tolist()
+                        labels = [labels[i][:eof] for i, eof in enumerate(seq_len)]
+                        result_matrix_list += result_matrix
+                        gold_matrix_list += labels
+                    P, R, F = score.score(result_matrix_list, gold_matrix_list)
+                    #P, R, F = score(result_matrix_list, gold_matrix_list, config['dataset'])
+                    #acc = score.accuracy(result_matrix_list, gold_matrix_list)
+                    batch_loss_avg = batch_loss / current_batch
+                    batch_loss = 0
+                    current_batch = 0
+                    #logging.info('epoch:'+str(epoch+1)+'||global_step:'+str(batch_step)+'||loss:'+
+                    #                str(batch_loss_avg)+'||f:'+str(F))
+                    
             print ("\rEpoch: %d ! the process is in %d of %d ! "%(epoch+1, batch+1, len(train_data_loader)), end='')
-        scheduler.step()
+        if config['warm_up'] is False:
+            scheduler.step()
+        end = time.time()
         loss_avg = total_loss / batch_step
         loss_list[epoch] = loss_avg
         print ("The loss is %f ! "%(loss_avg))
-    
+        print ("The time is %f ! "%(end - start))
+        total_time += (end - start)
+        
         #valid process
         model.eval()
+        start = time.time()
         with torch.no_grad():
             result_matrix_list = []
             gold_matrix_list = []
-            for batch, data in enumerate(test_data_loader):
+            for _, data in enumerate(test_data_loader):
                 inputs, labels, bi_inputs, pos_id, seq_len = data
                 tag_space = model(inputs.to(device), bi_inputs.to(device), pos_id.to(device), seq_len)           
                 result_matrix = tag_space.tolist()
@@ -916,28 +998,34 @@ def train(config):
                 labels = [labels[i][:eof] for i, eof in enumerate(seq_len)]
                 result_matrix_list += result_matrix
                 gold_matrix_list += labels
-                
-            P, R, F = score.score(result_matrix_list, gold_matrix_list)
-            acc = score.accuracy(result_matrix_list, gold_matrix_list)
             end = time.time()
-            print ('score| P:%.2f R:%.2f F:%.2f A:%.2f Time:%.2f'%(P, R, F, acc, end - start))
-            if F > F_log:
-                F_log = F
-                writeover = 1
-            else:
-                writeover = 0
-        if config['model_path'] and writeover == 1:
-            state = {'net':model.state_dict(), 'optimizer':optimizer.state_dict(), 'epoch':epoch}
-            model_name = os.path.join(config['model_path'],'best.pkl')
-            torch.save(state, model_name)
-            print ('\n the epoch %d is saved successfully, named %s !'%(epoch+1, model_name))
-            
+            P, R, F = score.score(result_matrix_list, gold_matrix_list)
+            #P, R, F = score(result_matrix_list, gold_matrix_list, config['dataset'])
+            #acc = score.accuracy(result_matrix_list, gold_matrix_list)
+            print ('score| P:%.2f R:%.2f F:%.2f' % (P, R, F))
+            total_time += (end - start)
+            sum_time = float(end-start)
+            per_time = sum_time / (config['batch_size']*len(test_data_loader))
+            print ('the time is %f, process %f time in per sentence' % (sum_time, per_time))
+            if F > best_f1:
+                best_f1 = F
+                if config['warm_up']:
+                    state = {'net':model.state_dict(), 'optimizer':optimizer.optimizer.state_dict(), 'epoch':epoch}
+                else:
+                    state = {'net':model.state_dict(), 'optimizer':optimizer.state_dict(), 'epoch':epoch}
+                model_name = os.path.join(config['model_path'], config['model_name'])
+                torch.save(state, model_name)
+                print ('\n the epoch %d is saved successfully, named %s !'%(epoch+1, model_name))
+                
+    #logging.info('epoch:'+str(epoch+1)+'||global_step:'+str(batch_step)+'||loss:'+str(batch_loss_avg)+'||f:'+str(F))
+    print('Model training time is: %f' % total_time)
 
 
 # In[10]:
 
 
 def test(config):
+    print(device)
     print ('get the test data') 
     config['module'] = 'test'    
     sents, idx, bi_idx, pos_id = prepareData(config)
@@ -949,6 +1037,8 @@ def test(config):
     model.load_state_dict(checkpoint['net'])
     model.eval()
     results = list()
+    total_time = 0.0
+    start = time.time()
     with torch.no_grad():
         for i in range(len(idx)):
             inputs = torch.tensor(idx[i]).unsqueeze(0)
@@ -957,24 +1047,18 @@ def test(config):
             seq_len = [len(idx[i])]
             result = model(inputs.to(device), bi_inputs.to(device), pos.to(device), seq_len).squeeze(0).tolist()
             results.append(result)
-    #print (sents, results)
+    end = time.time()
+    total_time = end - start
     new_results = repairResult(sents, results)
-    #print (new_results)
     write(new_results, config['output_file'])
-    print ('finish!')
-
-
-# In[ ]:
+    print ('Model test time is: %f' % (total_time))
+    
 
 
 if __name__ == '__main__':
-    train(config)
-    print ('main function finish!')
+    if config['module'] == 'train':
+        train(config)
+    else:
+        test(config)
+    #train(config)
     #test(config)
-
-
-# In[ ]:
-
-
-
-
